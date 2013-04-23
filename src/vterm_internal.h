@@ -27,6 +27,11 @@ struct VTermPen
   unsigned int font:4; /* To store 0-9 */
 };
 
+static inline int vterm_color_equal(VTermColor a, VTermColor b)
+{
+  return a.red == b.red && a.green == b.green && a.blue == b.blue;
+}
+
 struct VTermState
 {
   VTerm *vt;
@@ -87,10 +92,11 @@ struct VTermState
 
   VTermColor default_fg;
   VTermColor default_bg;
-  int fg_ansi;
+  int fg_index;
+  int bg_index;
   int bold_is_highbright;
 
-  int protected_cell;
+  unsigned int protected_cell : 1;
 
   /* Saved state under DEC mode 1048/1049 */
   struct {
@@ -162,11 +168,13 @@ void vterm_push_output_bytes(VTerm *vt, const char *bytes, size_t len);
 void vterm_push_output_vsprintf(VTerm *vt, const char *format, va_list args);
 void vterm_push_output_sprintf(VTerm *vt, const char *format, ...);
 void vterm_push_output_sprintf_ctrl(VTerm *vt, unsigned char ctrl, const char *fmt, ...);
+void vterm_push_output_sprintf_dcs(VTerm *vt, const char *fmt, ...);
 
 void vterm_state_free(VTermState *state);
 
 void vterm_state_resetpen(VTermState *state);
 void vterm_state_setpen(VTermState *state, const long args[], int argcount);
+int  vterm_state_getpen(VTermState *state, long args[], int argcount);
 void vterm_state_savepen(VTermState *state, int save);
 
 enum {

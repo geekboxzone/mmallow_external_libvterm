@@ -72,6 +72,7 @@ static VTermState *vterm_state_new(VTerm *vt)
 
 void vterm_state_free(VTermState *state)
 {
+  vterm_allocator_free(state->vt, state->tabstops);
   vterm_allocator_free(state->vt, state->combine_chars);
   vterm_allocator_free(state->vt, state);
 }
@@ -242,7 +243,7 @@ static int on_text(const char bytes[], size_t len, void *user)
     printf("}, onscreen width %d\n", width);
 #endif
 
-    if(state->at_phantom) {
+    if(state->at_phantom || state->pos.col + width > state->cols) {
       linefeed(state);
       state->pos.col = 0;
       state->at_phantom = 0;
@@ -1346,11 +1347,26 @@ static void request_status_string(VTermState *state, const char *command, size_t
 {
   if(cmdlen == 1)
     switch(command[0]) {
+      case 'm': // Query SGR
+        {
+          long args[20];
+          int argc = vterm_state_getpen(state, args, sizeof(args)/sizeof(args[0]));
+          vterm_push_output_sprintf_ctrl(state->vt, C1_DCS, "1$r");
+          for(int argi = 0; argi < argc; argi++)
+            vterm_push_output_sprintf(state->vt,
+                argi == argc - 1             ? "%d" :
+                CSI_ARG_HAS_MORE(args[argi]) ? "%d:" :
+                                               "%d;",
+                CSI_ARG(args[argi]));
+          vterm_push_output_sprintf(state->vt, "m");
+          vterm_push_output_sprintf_ctrl(state->vt, C1_ST, "");
+        }
+        return;
       case 'r': // Query DECSTBM
-        vterm_push_output_sprintf_ctrl(state->vt, C1_DCS, "1$r%d;%dr", state->scrollregion_top+1, SCROLLREGION_BOTTOM(state));
+        vterm_push_output_sprintf_dcs(state->vt, "1$r%d;%dr", state->scrollregion_top+1, SCROLLREGION_BOTTOM(state));
         return;
       case 's': // Query DECSLRM
-        vterm_push_output_sprintf_ctrl(state->vt, C1_DCS, "1$r%d;%ds", SCROLLREGION_LEFT(state)+1, SCROLLREGION_RIGHT(state));
+        vterm_push_output_sprintf_dcs(state->vt, "1$r%d;%ds", SCROLLREGION_LEFT(state)+1, SCROLLREGION_RIGHT(state));
         return;
     }
 
@@ -1364,16 +1380,16 @@ static void request_status_string(VTermState *state, const char *command, size_t
       }
       if(state->mode.cursor_blink)
         reply--;
-      vterm_push_output_sprintf_ctrl(state->vt, C1_DCS, "1$r%d q", reply);
+      vterm_push_output_sprintf_dcs(state->vt, "1$r%d q", reply);
       return;
     }
     else if(strneq(command, "\"q", 2)) {
-      vterm_push_output_sprintf_ctrl(state->vt, C1_DCS, "1$r%d\"q", state->protected_cell ? 1 : 2);
+      vterm_push_output_sprintf_dcs(state->vt, "1$r%d\"q", state->protected_cell ? 1 : 2);
       return;
     }
   }
 
-  vterm_push_output_sprintf_ctrl(state->vt, C1_DCS, "0$r%.s", (int)cmdlen, command);
+  vterm_push_output_sprintf_dcs(state->vt, "0$r%.s", (int)cmdlen, command);
 }
 
 static int on_dcs(const char *command, size_t cmdlen, void *user)
@@ -1421,18 +1437,23 @@ static int on_resize(int rows, int cols, void *user)
   state->rows = rows;
   state->cols = cols;
 
-  if(state->pos.row >= rows)
-    state->pos.row = rows - 1;
-  if(state->pos.col >= cols)
-    state->pos.col = cols - 1;
+  VTermPos delta = { 0, 0 };
+
+  if(state->callbacks && state->callbacks->resize)
+    (*state->callbacks->resize)(rows, cols, &delta, state->cbdata);
 
   if(state->at_phantom && state->pos.col < cols-1) {
     state->at_phantom = 0;
     state->pos.col++;
   }
 
-  if(state->callbacks && state->callbacks->resize)
-    (*state->callbacks->resize)(rows, cols, state->cbdata);
+  state->pos.row += delta.row;
+  state->pos.col += delta.col;
+
+  if(state->pos.row >= rows)
+    state->pos.row = rows - 1;
+  if(state->pos.col >= cols)
+    state->pos.col = cols - 1;
 
   updatecursor(state, &oldpos, 1);
 

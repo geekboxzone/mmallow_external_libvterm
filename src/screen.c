@@ -34,6 +34,8 @@ typedef struct
   ScreenPen pen;
 } ScreenCell;
 
+static int vterm_screen_set_cell(VTermScreen *screen, VTermPos pos, const VTermScreenCell *cell);
+
 struct VTermScreen
 {
   VTerm *vt;
@@ -57,6 +59,9 @@ struct VTermScreen
 
   /* buffer will == buffers[0] or buffers[1], depending on altscreen */
   ScreenCell *buffer;
+
+  /* buffer for a single screen row used in scrollback storage callbacks */
+  VTermScreenCell *sb_buffer;
 
   ScreenPen pen;
 };
@@ -199,45 +204,16 @@ static int moverect_internal(VTermRect dest, VTermRect src, void *user)
 {
   VTermScreen *screen = user;
 
-  if(screen->callbacks && screen->callbacks->prescroll) {
-    // TODO: These calculations don't properly take account of combined
-    // horizontal and vertical movements
-    if(dest.start_row < src.start_row) {
-      VTermRect rect = {
-        .start_row = dest.start_row,
-        .end_row   = src.start_row,
-        .start_col = dest.start_col,
-        .end_col   = dest.end_col,
-      };
-      (*screen->callbacks->prescroll)(rect, screen->cbdata);
-    }
-    else if(dest.start_row > src.start_row) {
-      VTermRect rect = {
-        .start_row = src.end_row,
-        .end_row   = dest.end_row,
-        .start_col = dest.start_col,
-        .end_col   = dest.end_col,
-      };
-      (*screen->callbacks->prescroll)(rect, screen->cbdata);
-    }
+  if(screen->callbacks && screen->callbacks->sb_pushline &&
+     dest.start_row == 0 && dest.start_col == 0 &&  // starts top-left corner
+     dest.end_col == screen->cols &&                // full width
+     screen->buffer == screen->buffers[0]) {        // not altscreen
+    VTermPos pos;
+    for(pos.row = 0; pos.row < src.start_row; pos.row++) {
+      for(pos.col = 0; pos.col < screen->cols; pos.col++)
+        vterm_screen_get_cell(screen, pos, screen->sb_buffer + pos.col);
 
-    if(dest.start_col < src.start_col) {
-      VTermRect rect = {
-        .start_row = dest.start_row,
-        .end_row   = dest.end_row,
-        .start_col = dest.start_col,
-        .end_col   = src.start_col,
-      };
-      (*screen->callbacks->prescroll)(rect, screen->cbdata);
-    }
-    else if(dest.start_col > src.start_col) {
-      VTermRect rect = {
-        .start_row = dest.start_row,
-        .end_row   = dest.end_row,
-        .start_col = src.end_col,
-        .end_col   = dest.end_col,
-      };
-      (*screen->callbacks->prescroll)(rect, screen->cbdata);
+      (screen->callbacks->sb_pushline)(screen->cols, screen->sb_buffer, screen->cbdata);
     }
   }
 
@@ -492,11 +468,37 @@ static int bell(void *user)
   return 0;
 }
 
-static int resize(int new_rows, int new_cols, void *user)
+static int resize(int new_rows, int new_cols, VTermPos *delta, void *user)
 {
   VTermScreen *screen = user;
 
   int is_altscreen = (screen->buffers[1] && screen->buffer == screen->buffers[1]);
+
+  int old_rows = screen->rows;
+  int old_cols = screen->cols;
+
+  if(!is_altscreen && new_rows < old_rows) {
+    // Fewer rows - determine if we're going to scroll at all, and if so, push
+    // those lines to scrollback
+    VTermPos pos = { 0, 0 };
+    for(pos.row = old_rows - 1; pos.row >= new_rows; pos.row--)
+      if(!vterm_screen_is_eol(screen, pos))
+        break;
+
+    int first_blank_row = pos.row + 1;
+    if(first_blank_row > new_rows) {
+      VTermRect rect = {
+        .start_row = 0,
+        .end_row   = old_rows,
+        .start_col = 0,
+        .end_col   = old_cols,
+      };
+      scrollrect(rect, first_blank_row - new_rows, 0, user);
+      vterm_screen_flush_damage(screen);
+
+      delta->row -= first_blank_row - new_rows;
+    }
+  }
 
   screen->buffers[0] = realloc_buffer(screen, screen->buffers[0], new_rows, new_cols);
   if(screen->buffers[1])
@@ -504,11 +506,13 @@ static int resize(int new_rows, int new_cols, void *user)
 
   screen->buffer = is_altscreen ? screen->buffers[1] : screen->buffers[0];
 
-  int old_rows = screen->rows;
-  int old_cols = screen->cols;
-
   screen->rows = new_rows;
   screen->cols = new_cols;
+
+  if(screen->sb_buffer)
+    vterm_allocator_free(screen->vt, screen->sb_buffer);
+
+  screen->sb_buffer = vterm_allocator_malloc(screen->vt, sizeof(VTermScreenCell) * new_cols);
 
   if(new_cols > old_cols) {
     VTermRect rect = {
@@ -521,6 +525,34 @@ static int resize(int new_rows, int new_cols, void *user)
   }
 
   if(new_rows > old_rows) {
+    if(!is_altscreen && screen->callbacks && screen->callbacks->sb_popline) {
+      int rows = new_rows - old_rows;
+      while(rows) {
+        if(!(screen->callbacks->sb_popline(screen->cols, screen->sb_buffer, screen->cbdata)))
+          break;
+
+        VTermRect rect = {
+          .start_row = 0,
+          .end_row   = screen->rows,
+          .start_col = 0,
+          .end_col   = screen->cols,
+        };
+        scrollrect(rect, -1, 0, user);
+
+        VTermPos pos = { 0, 0 };
+        for(pos.col = 0; pos.col < screen->cols; pos.col += screen->sb_buffer[pos.col].width)
+          vterm_screen_set_cell(screen, pos, screen->sb_buffer + pos.col);
+
+        rect.end_row = 1;
+        damagerect(screen, rect);
+
+        vterm_screen_flush_damage(screen);
+
+        rows--;
+        delta->row++;
+      }
+    }
+
     VTermRect rect = {
       .start_row = old_rows,
       .end_row   = new_rows,
@@ -573,6 +605,8 @@ static VTermScreen *screen_new(VTerm *vt)
 
   screen->buffer = screen->buffers[0];
 
+  screen->sb_buffer = vterm_allocator_malloc(screen->vt, sizeof(VTermScreenCell) * cols);
+
   vterm_state_set_callbacks(screen->state, &state_cbs, screen);
 
   return screen;
@@ -583,6 +617,8 @@ void vterm_screen_free(VTermScreen *screen)
   vterm_allocator_free(screen->vt, screen->buffers[0]);
   if(screen->buffers[1])
     vterm_allocator_free(screen->vt, screen->buffers[1]);
+
+  vterm_allocator_free(screen->vt, screen->sb_buffer);
 
   vterm_allocator_free(screen->vt, screen);
 }
@@ -688,6 +724,37 @@ int vterm_screen_get_cell(const VTermScreen *screen, VTermPos pos, VTermScreenCe
   return 1;
 }
 
+/* Copy external to internal representation of a screen cell */
+/* static because it's only used internally for sb_popline during resize */
+static int vterm_screen_set_cell(VTermScreen *screen, VTermPos pos, const VTermScreenCell *cell)
+{
+  ScreenCell *intcell = getcell(screen, pos.row, pos.col);
+  if(!intcell)
+    return 0;
+
+  for(int i = 0; ; i++) {
+    intcell->chars[i] = cell->chars[i];
+    if(!cell->chars[i])
+      break;
+  }
+
+  intcell->pen.bold      = cell->attrs.bold;
+  intcell->pen.underline = cell->attrs.underline;
+  intcell->pen.italic    = cell->attrs.italic;
+  intcell->pen.blink     = cell->attrs.blink;
+  intcell->pen.reverse   = cell->attrs.reverse ^ screen->global_reverse;
+  intcell->pen.strike    = cell->attrs.strike;
+  intcell->pen.font      = cell->attrs.font;
+
+  intcell->pen.fg = cell->fg;
+  intcell->pen.bg = cell->bg;
+
+  if(cell->width == 2)
+    getcell(screen, pos.row, pos.col + 1)->chars[0] = (uint32_t)-1;
+
+  return 1;
+}
+
 int vterm_screen_is_eol(const VTermScreen *screen, VTermPos pos)
 {
   /* This cell is EOL if this and every cell to the right is black */
@@ -749,4 +816,56 @@ void vterm_screen_set_damage_merge(VTermScreen *screen, VTermDamageSize size)
 {
   vterm_screen_flush_damage(screen);
   screen->damage_merge = size;
+}
+
+static int attrs_differ(VTermAttrMask attrs, ScreenCell *a, ScreenCell *b)
+{
+  if((attrs & VTERM_ATTR_BOLD_MASK)       && (a->pen.bold != b->pen.bold))
+    return 1;
+  if((attrs & VTERM_ATTR_UNDERLINE_MASK)  && (a->pen.underline != b->pen.underline))
+    return 1;
+  if((attrs & VTERM_ATTR_ITALIC_MASK)     && (a->pen.italic != b->pen.italic))
+    return 1;
+  if((attrs & VTERM_ATTR_BLINK_MASK)      && (a->pen.blink != b->pen.blink))
+    return 1;
+  if((attrs & VTERM_ATTR_REVERSE_MASK)    && (a->pen.reverse != b->pen.reverse))
+    return 1;
+  if((attrs & VTERM_ATTR_STRIKE_MASK)     && (a->pen.strike != b->pen.strike))
+    return 1;
+  if((attrs & VTERM_ATTR_FONT_MASK)       && (a->pen.font != b->pen.font))
+    return 1;
+  if((attrs & VTERM_ATTR_FOREGROUND_MASK) && !vterm_color_equal(a->pen.fg, b->pen.fg))
+    return 1;
+  if((attrs & VTERM_ATTR_BACKGROUND_MASK) && !vterm_color_equal(a->pen.bg, b->pen.bg))
+    return 1;
+
+  return 0;
+}
+
+int vterm_screen_get_attrs_extent(const VTermScreen *screen, VTermRect *extent, VTermPos pos, VTermAttrMask attrs)
+{
+  ScreenCell *target = getcell(screen, pos.row, pos.col);
+
+  // TODO: bounds check
+  extent->start_row = pos.row;
+  extent->end_row   = pos.row + 1;
+
+  if(extent->start_col < 0)
+    extent->start_col = 0;
+  if(extent->end_col < 0)
+    extent->end_col = screen->cols;
+
+  int col;
+
+  for(col = pos.col - 1; col >= extent->start_col; col--)
+    if(attrs_differ(attrs, target, getcell(screen, pos.row, col)))
+      break;
+  extent->start_col = col + 1;
+
+  for(col = pos.col + 1; col < extent->end_col; col++)
+    if(attrs_differ(attrs, target, getcell(screen, pos.row, col)))
+      break;
+  extent->end_col = col - 1;
+
+  return 1;
 }
